@@ -1,53 +1,140 @@
 name: Isolated Duo visual smoke
-run-name: Isolated Duo simulator discovery (${{ github.ref_name }})
+run-name: Isolated Duo unsigned UI smoke (${{ github.ref_name }})
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  discover:
+  smoke:
     runs-on: xcode-27
-    timeout-minutes: 8
+    timeout-minutes: 38
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
       CI: 'true'
+      EVIDENCE: ${{ runner.temp }}/duo-evidence
+      DERIVED_DATA: ${{ runner.temp }}/duo-derived
     steps:
-      - name: Discover supported simulator commands
-        shell: bash
-        run: |
-          mkdir -p "$RUNNER_TEMP/evidence"
-          xcodebuild -version > "$RUNNER_TEMP/evidence/xcode.txt" 2>&1
-          xcrun simctl list -j > "$RUNNER_TEMP/evidence/simulators.json"
-          xcrun simctl help > "$RUNNER_TEMP/evidence/simctl-help.txt" 2>&1
-          xcrun simctl help io > "$RUNNER_TEMP/evidence/simctl-io-help.txt" 2>&1
-          xcrun simctl help ui > "$RUNNER_TEMP/evidence/simctl-ui-help.txt" 2>&1
-          python3 - <<'PY'
-          import os, pathlib, re, subprocess
-          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'evidence'
-          help=(p/'simctl-help.txt').read_text()
-          for line in help.splitlines():
-              if re.search(r'fold|display|posture|hinge', line, re.I):
-                  m=re.match(r'^\s+([a-z][a-z0-9_-]+)\s+', line)
-                  if m:
-                      command=m.group(1)
-                      result=subprocess.run(['xcrun','simctl','help',command],capture_output=True,text=True)
-                      (p/f'simctl-{command}-help.txt').write_text(result.stdout+result.stderr)
-          PY
-      - name: Create clean Duo and enumerate displays
-        shell: bash
-        run: |
-          UDID=$(xcrun simctl create "Hermes-Duo-discovery-${GITHUB_RUN_ID}" com.apple.CoreSimulator.SimDeviceType.iPhone-Duo com.apple.CoreSimulator.SimRuntime.iOS-27-1)
-          trap 'xcrun simctl shutdown "$UDID" || true; xcrun simctl delete "$UDID" || true' EXIT
-          xcrun simctl boot "$UDID"
-          xcrun simctl bootstatus "$UDID" -b
-          xcrun simctl io "$UDID" enumerate > "$RUNNER_TEMP/evidence/displays.txt" 2>&1
-          xcrun simctl help launch > "$RUNNER_TEMP/evidence/launch-help.txt" 2>&1
-          xcrun simctl help spawn > "$RUNNER_TEMP/evidence/spawn-help.txt" 2>&1
-          xcrun simctl help status_bar > "$RUNNER_TEMP/evidence/status-bar-help.txt" 2>&1
-      - uses: actions/upload-artifact@v6
-        if: always()
+      - name: Checkout isolated test branch
+        uses: actions/checkout@v5
         with:
-          name: duo-discovery
-          path: ${{ runner.temp }}/evidence
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact base and workflow-only delta
+        shell: bash
+        run: |
+          mkdir -p "$EVIDENCE"
+          python3 - <<'PY'
+          import subprocess, os, pathlib, json
+          p=pathlib.Path(os.environ['EVIDENCE'])
+          base='9ccaad14cbb8ff36dc5b41b465124418f578fcf0'
+          changed=subprocess.check_output(['git','diff','--name-only',base,'HEAD'],text=True).splitlines()
+          assert changed==['.github/workflows/unit_tests.yml'], changed
+          subprocess.run(['git','merge-base','--is-ancestor',base,'HEAD'],check=True)
+          (p/'source.json').write_text(json.dumps({'base':base,'head':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'changed':changed,'run_url':'https://github.com/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+os.environ['GITHUB_RUN_ID'],'scope':'Clean simulator onboarding only; no patient state, pump connection, source edits, signing credentials or distribution uploads.'},indent=2))
+          (p/'submodules.txt').write_text(subprocess.check_output(['git','submodule','status','--recursive'],text=True))
+          PY
+          xcodebuild -version | tee "$EVIDENCE/xcode.txt"
+          xcodebuild -showsdks > "$EVIDENCE/sdks.txt"
+          xcrun simctl list -j > "$EVIDENCE/simulators.json"
+          xcrun simctl help io > "$EVIDENCE/simctl-io-help.txt" 2>&1
+          xcrun simctl help launch > "$EVIDENCE/simctl-launch-help.txt" 2>&1
+      - name: Build unsigned simulator app with no source changes
+        timeout-minutes: 25
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild -workspace Trio.xcworkspace -scheme Trio -configuration Debug \
+            -sdk iphonesimulator27.1 -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$DERIVED_DATA" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/duo-packages" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM= DEVELOPER_TEAM= ONLY_ACTIVE_ARCH=YES ARCHS=arm64 \
+            COMPILER_INDEX_STORE_ENABLE=NO build 2>&1 | tee "$EVIDENCE/build.log"
+      - name: Launch clean Duo and capture supported display configurations
+        timeout-minutes: 9
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, subprocess, json, plistlib, re, time, shutil, traceback
+          out=pathlib.Path(os.environ['EVIDENCE'])
+          commands=[]
+          def run(args, timeout=60, required=True):
+              result=subprocess.run(args,capture_output=True,text=True,timeout=timeout)
+              commands.append({'command':args,'returncode':result.returncode,'stdout':result.stdout,'stderr':result.stderr})
+              (out/'commands.json').write_text(json.dumps(commands,indent=2))
+              if required and result.returncode:
+                  raise RuntimeError(str(args)+' failed: '+result.stderr)
+              return result
+          sim=None
+          try:
+              app=pathlib.Path(os.environ['DERIVED_DATA'])/'Build/Products/Debug-iphonesimulator/Trio.app'
+              assert app.is_dir(), str(app)
+              info=plistlib.loads((app/'Info.plist').read_bytes())
+              bundle=info['CFBundleIdentifier']
+              (out/'app-info.json').write_text(json.dumps({k:info.get(k) for k in ['CFBundleIdentifier','CFBundleShortVersionString','CFBundleVersion','DTSDKName','DTXcode','DTXcodeBuild','MinimumOSVersion']},indent=2))
+              run(['codesign','-dv',str(app)],required=False)
+              sim=run(['xcrun','simctl','create','Hermes-Duo-'+os.environ['GITHUB_RUN_ID'],'com.apple.CoreSimulator.SimDeviceType.iPhone-Duo','com.apple.CoreSimulator.SimRuntime.iOS-27-1']).stdout.strip()
+              (out/'simulator-udid.txt').write_text(sim)
+              run(['xcrun','simctl','boot',sim])
+              run(['xcrun','simctl','bootstatus',sim,'-b'],timeout=340)
+              enumerated=run(['xcrun','simctl','io',sim,'enumerate']).stdout
+              (out/'displays-initial.txt').write_text(enumerated)
+              screens=[]
+              for block in re.split(r'(?=        Screen ID:)',enumerated)[1:]:
+                  if 'Screen Type: Integrated' not in block: continue
+                  sid=re.search(r'Screen ID: (\d+)',block).group(1)
+                  name=re.search(r'Device Name: (\S+)',block).group(1)
+                  width,height=map(int,re.search(r'Pixel Size: \{(\d+), (\d+)\}',block).groups())
+                  screens.append({'id':sid,'name':name,'width':width,'height':height})
+              assert len(screens)==2, screens
+              screens.sort(key=lambda x:x['width']*x['height'])
+              screens[0]['label']='outer-smaller'
+              screens[1]['label']='inner-larger'
+              (out/'screens.json').write_text(json.dumps(screens,indent=2))
+              run(['xcrun','simctl','install',sim,str(app)],timeout=90)
+              (out/'installed-app.txt').write_text(run(['xcrun','simctl','appinfo',sim,bundle]).stdout)
+              for screen in screens:
+                  label=screen['label']
+                  for other in screens:
+                      if other['id']!=screen['id']:
+                          run(['xcrun','simctl','io',sim,'screenConfig','--display='+other['id'],'power','off'],required=False)
+                  run(['xcrun','simctl','io',sim,'screenConfig','--display='+screen['id'],'power','on'],required=False)
+                  launch=run(['xcrun','simctl','launch','--terminate-running-process','--stdout='+str(out/(label+'-stdout.txt')),'--stderr='+str(out/(label+'-stderr.txt')),sim,bundle],required=False)
+                  (out/(label+'-launch.txt')).write_text(launch.stdout+launch.stderr)
+                  time.sleep(12)
+                  match=re.search(r': (\d+)\s*$',launch.stdout)
+                  if match:
+                      process=run(['ps','-p',match.group(1),'-o','pid=,comm='],required=False)
+                      (out/(label+'-process.txt')).write_text(process.stdout+process.stderr)
+                  (out/(label+'-displays.txt')).write_text(run(['xcrun','simctl','io',sim,'enumerate']).stdout)
+                  run(['xcrun','simctl','io',sim,'screenshot','--display='+screen['id'],str(out/(label+'-launch.png'))],required=False)
+              (out/'coverage.txt').write_text('Real simulator captures after clean install. Outer/inner labels are inferred from integrated display pixel areas. Supported screenConfig power on/off used; no fold command exists in simctl help. No onboarding consent accepted, no patient or therapy settings entered. Pixel content requires independent visual inspection; screenshot existence alone is not proof of app UI or clinical correctness.\n')
+          except Exception:
+              (out/'smoke-error.txt').write_text(traceback.format_exc())
+              raise
+          finally:
+              crashdir=pathlib.Path.home()/'Library/Logs/DiagnosticReports'
+              for f in crashdir.glob('Trio*'):
+                  if f.is_file(): shutil.copy2(f,out/f.name)
+              if sim:
+                  run(['xcrun','simctl','shutdown',sim],required=False)
+                  run(['xcrun','simctl','delete',sim],required=False)
+          PY
+      - name: Verify checkout unchanged
+        if: always()
+        shell: bash
+        run: |
+          git status --porcelain > "$EVIDENCE/checkout-status.txt"
+          git diff --exit-code
+          git submodule foreach --recursive 'git diff --exit-code'
+      - name: Upload screenshots and logs only
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: duo-ui-evidence
+          path: ${{ runner.temp }}/duo-evidence
           retention-days: 7
+          compression-level: 6
           if-no-files-found: error
