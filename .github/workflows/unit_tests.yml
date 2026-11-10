@@ -11,9 +11,11 @@ jobs:
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
       CI: 'true'
-      EVIDENCE: ${{ runner.temp }}/duo-evidence
-      DERIVED_DATA: ${{ runner.temp }}/duo-derived
     steps:
+      - name: Set isolated runner paths
+        shell: bash
+        run: |
+          printf 'EVIDENCE=%s/duo-evidence\nDERIVED_DATA=%s/duo-derived\n' "$RUNNER_TEMP" "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Checkout isolated test branch
         uses: actions/checkout@v5
         with:
