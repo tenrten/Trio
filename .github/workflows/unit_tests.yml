@@ -33,6 +33,17 @@ jobs:
                       result=subprocess.run(['xcrun','simctl','help',command],capture_output=True,text=True)
                       (p/f'simctl-{command}-help.txt').write_text(result.stdout+result.stderr)
           PY
+      - name: Create clean Duo and enumerate displays
+        shell: bash
+        run: |
+          UDID=$(xcrun simctl create "Hermes-Duo-discovery-${GITHUB_RUN_ID}" com.apple.CoreSimulator.SimDeviceType.iPhone-Duo com.apple.CoreSimulator.SimRuntime.iOS-27-1)
+          trap 'xcrun simctl shutdown "$UDID" || true; xcrun simctl delete "$UDID" || true' EXIT
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl io "$UDID" enumerate > "$RUNNER_TEMP/evidence/displays.txt" 2>&1
+          xcrun simctl help launch > "$RUNNER_TEMP/evidence/launch-help.txt" 2>&1
+          xcrun simctl help spawn > "$RUNNER_TEMP/evidence/spawn-help.txt" 2>&1
+          xcrun simctl help status_bar > "$RUNNER_TEMP/evidence/status-bar-help.txt" 2>&1
       - uses: actions/upload-artifact@v6
         if: always()
         with:
