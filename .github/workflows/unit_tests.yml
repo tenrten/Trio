@@ -47,7 +47,7 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild -workspace Trio.xcworkspace -scheme Trio -configuration Debug \
-            -sdk iphonesimulator27.1 -destination 'generic/platform=iOS Simulator' \
+            -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath "$DERIVED_DATA" \
             -clonedSourcePackagesDirPath "$RUNNER_TEMP/duo-packages" \
             -onlyUsePackageVersionsFromResolvedFile \
