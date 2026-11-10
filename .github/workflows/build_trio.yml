@@ -189,7 +189,7 @@ jobs:
   build:
     name: Build
     needs: [check_certs, check_status]
-    runs-on: macos-26
+    runs-on: xcode-27
     permissions:
       contents: write
     if:
@@ -199,7 +199,7 @@ jobs:
         (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
     steps:
       - name: Select Xcode version
-        run: "sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer"
+        run: "sudo xcode-select --switch /Applications/Xcode_27.1.app/Contents/Developer"
       
       - name: Checkout Repo for building
         uses: actions/checkout@v5
@@ -281,6 +281,20 @@ jobs:
           FASTLANE_ISSUER_ID: ${{ secrets.FASTLANE_ISSUER_ID }}
           FASTLANE_KEY: ${{ secrets.FASTLANE_KEY }}
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+
+      # Verify the signed artifact, not just the selected compiler.
+      - name: Verify Duo SDK in signed IPA
+        run: |
+          python3 - <<'PY'
+          import zipfile, plistlib
+          with zipfile.ZipFile('Trio.ipa') as z:
+              names=[n for n in z.namelist() if n.startswith('Payload/') and n.count('/')==2 and n.endswith('.app/Info.plist')]
+              assert len(names)==1, names
+              p=plistlib.loads(z.read(names[0]))
+          print({k:p.get(k) for k in ['DTXcode','DTXcodeBuild','DTSDKName','CFBundleShortVersionString','CFBundleVersion']})
+          assert p['DTSDKName']=='iphoneos27.1', 'Wrong SDK: do not upload'
+          assert p['DTXcode'].startswith('271'), 'Wrong Xcode: do not upload'
+          PY
 
       # Upload to TestFlight
       - name: Fastlane upload to TestFlight
